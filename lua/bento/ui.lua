@@ -16,6 +16,10 @@ local bento_win_id = nil
 --- @type number|nil
 local bento_bufh = nil
 
+--- Floating window state keyed by tabpage
+--- @type table<number, {win_id: number|nil, bufnr: number|nil, hidden: boolean|nil}>
+local floating_tab_state = {}
+
 --- Last editor window ID (non-floating window)
 --- @type number|nil
 local last_editor_win = nil
@@ -72,6 +76,10 @@ local tabline_end_idx = 1
 --- @type number
 local current_page = 1
 
+--- Forward declaration for collapsed floating render helper
+--- @type fun()
+local render_collapsed
+
 --- Initialize UI state from configuration
 --- @return nil
 function M.setup_state()
@@ -81,6 +89,105 @@ function M.setup_state()
     end
     if minimal_menu_active == nil then
         minimal_menu_active = config.ui.floating.minimal_menu
+    end
+end
+
+--- Get the current tabpage ID
+--- @return number
+local function get_current_tabpage()
+    return vim.api.nvim_get_current_tabpage()
+end
+
+--- Get validated floating state for a tabpage
+--- @param tabpage number
+--- @return {win_id: number|nil, bufnr: number|nil, hidden: boolean|nil}|nil
+local function get_tab_state(tabpage)
+    local state = floating_tab_state[tabpage]
+    if not state then
+        return nil
+    end
+
+    if state.win_id and not vim.api.nvim_win_is_valid(state.win_id) then
+        state.win_id = nil
+    end
+    if state.bufnr and not vim.api.nvim_buf_is_valid(state.bufnr) then
+        state.bufnr = nil
+    end
+
+    if not state.win_id and not state.bufnr and not state.hidden then
+        floating_tab_state[tabpage] = nil
+        return nil
+    end
+
+    return state
+end
+
+--- Synchronize the current tabpage state into the active floating handles
+--- @return number tabpage
+--- @return {win_id: number|nil, bufnr: number|nil, hidden: boolean|nil}|nil state
+local function sync_current_tab_state()
+    local tabpage = get_current_tabpage()
+    local state = get_tab_state(tabpage)
+
+    bento_win_id = state and state.win_id or nil
+    bento_bufh = state and state.bufnr or nil
+
+    return tabpage, state
+end
+
+--- Set floating state for a tabpage
+--- @param tabpage number
+--- @param state {win_id: number|nil, bufnr: number|nil, hidden: boolean|nil}|nil
+--- @return nil
+local function set_tab_state(tabpage, state)
+    if state and (state.win_id or state.bufnr or state.hidden) then
+        floating_tab_state[tabpage] = state
+    else
+        floating_tab_state[tabpage] = nil
+    end
+end
+
+--- Store floating handles for the current tabpage
+--- @param win_id number
+--- @param bufnr number
+--- @return nil
+local function set_current_tab_window(win_id, bufnr)
+    local tabpage = get_current_tabpage()
+    set_tab_state(tabpage, {
+        win_id = win_id,
+        bufnr = bufnr,
+        hidden = false,
+    })
+    bento_win_id = win_id
+    bento_bufh = bufnr
+end
+
+--- Clear floating state for a tabpage
+--- @param tabpage number
+--- @param opts {close_window: boolean|nil, hidden: boolean|nil}|nil
+--- @return nil
+local function clear_tab_window(tabpage, opts)
+    opts = opts or {}
+    local state = get_tab_state(tabpage)
+
+    if
+        opts.close_window
+        and state
+        and state.win_id
+        and vim.api.nvim_win_is_valid(state.win_id)
+    then
+        vim.api.nvim_win_close(state.win_id, true)
+    end
+
+    if opts.hidden then
+        set_tab_state(tabpage, { hidden = true })
+    else
+        set_tab_state(tabpage, nil)
+    end
+
+    if tabpage == get_current_tabpage() then
+        bento_win_id = nil
+        bento_bufh = nil
     end
 end
 
@@ -168,6 +275,24 @@ local function find_main_window()
         end
     end
     return current_win
+end
+
+--- Capture the most relevant editor window for later buffer actions
+--- @return nil
+local function remember_last_editor_window()
+    local cur_win = vim.api.nvim_get_current_win()
+    local cfg = vim.api.nvim_win_get_config(cur_win)
+    if cfg.relative == "" then
+        last_editor_win = cur_win
+        return
+    end
+
+    for _, win_id in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_get_config(win_id).relative == "" then
+            last_editor_win = win_id
+            return
+        end
+    end
 end
 
 --- Update marks (buffer list) by removing invalid buffers and adding new ones
@@ -514,6 +639,7 @@ local function create_window(height, width)
         focusable = false,
     })
 
+    vim.api.nvim_buf_set_var(bufnr, "bento_menu", true)
     vim.api.nvim_buf_set_option(bufnr, "modifiable", false)
     vim.api.nvim_buf_set_option(bufnr, "buftype", "nofile")
     vim.api.nvim_buf_set_option(bufnr, "bufhidden", "wipe")
@@ -534,6 +660,7 @@ end
 --- @param height number New height
 --- @return nil
 local function update_window_size(width, height)
+    sync_current_tab_state()
     if not bento_win_id or not vim.api.nvim_win_is_valid(bento_win_id) then
         return
     end
@@ -547,6 +674,58 @@ local function update_window_size(width, height)
         row = row,
         col = col,
     })
+end
+
+--- Create the floating menu window for the current tab
+--- @return boolean
+local function create_current_tab_window()
+    remember_last_editor_window()
+    update_marks()
+
+    if #marks == 0 then
+        return false
+    end
+
+    local padding = config.ui.floating.label_padding or 1
+    local initial_width = 2 + 2 * padding
+    local win_info = create_window(#marks, initial_width)
+    set_current_tab_window(win_info.win_id, win_info.bufnr)
+
+    return true
+end
+
+--- Ensure the current tab has a floating menu window when appropriate
+--- @param opts {force_create: boolean|nil, render_collapsed: boolean|nil}|nil
+--- @return boolean
+local function ensure_current_tab_window(opts)
+    opts = opts or {}
+    local _, state = sync_current_tab_state()
+
+    if bento_win_id and vim.api.nvim_win_is_valid(bento_win_id) then
+        return true
+    end
+
+    if state and state.hidden and not opts.force_create then
+        return false
+    end
+
+    if not minimal_menu_active and not opts.force_create then
+        return false
+    end
+
+    if not create_current_tab_window() then
+        return false
+    end
+
+    is_expanded = false
+    current_action = nil
+    current_page = 1
+
+    if opts.render_collapsed and minimal_menu_active then
+        render_collapsed()
+    end
+
+    return true
 end
 
 --- Check if buffer is active (visible in any window)
@@ -714,6 +893,7 @@ end
 --- Display menu in dashed collapsed state
 --- @return nil
 local function render_dashed()
+    sync_current_tab_state()
     if not bento_bufh or not vim.api.nvim_buf_is_valid(bento_bufh) then
         return
     end
@@ -783,6 +963,7 @@ end
 --- Display menu in filename-only collapsed state
 --- @return nil
 local function render_filename_collapsed()
+    sync_current_tab_state()
     if not bento_bufh or not vim.api.nvim_buf_is_valid(bento_bufh) then
         return
     end
@@ -916,6 +1097,7 @@ end
 --- @param is_minimal_full boolean|nil If true, uses minimal highlight for labels
 --- @return nil
 local function render_expanded(is_minimal_full)
+    sync_current_tab_state()
     if not bento_bufh or not vim.api.nvim_buf_is_valid(bento_bufh) then
         return
     end
@@ -1480,7 +1662,7 @@ end
 
 --- Render the appropriate collapsed view based on minimal_menu mode
 --- @return nil
-local function render_collapsed()
+render_collapsed = function()
     if minimal_menu_active == "dashed" then
         render_dashed()
     elseif minimal_menu_active == "filename" then
@@ -1491,8 +1673,9 @@ local function render_collapsed()
 end
 
 --- Close the menu completely
+--- @param mark_hidden boolean|nil Whether to keep the current tab hidden until explicitly reopened
 --- @return nil
-function M.close_menu()
+function M.close_menu(mark_hidden)
     if is_tabline_ui() then
         restore_tabline_settings()
         tabline_active = false
@@ -1504,11 +1687,11 @@ function M.close_menu()
     end
 
     -- Floating UI
-    if bento_win_id and vim.api.nvim_win_is_valid(bento_win_id) then
-        vim.api.nvim_win_close(bento_win_id, true)
-    end
-    bento_win_id = nil
-    bento_bufh = nil
+    local tabpage = sync_current_tab_state()
+    clear_tab_window(tabpage, {
+        close_window = true,
+        hidden = mark_hidden == true,
+    })
     is_expanded = false
     current_action = nil
     current_page = 1
@@ -1618,29 +1801,17 @@ function M.toggle_menu(force_create)
     end
 
     -- Floating UI
+    sync_current_tab_state()
     if bento_win_id and vim.api.nvim_win_is_valid(bento_win_id) then
-        M.close_menu()
+        M.close_menu(true)
         return
     end
 
-    local cur_win = vim.api.nvim_get_current_win()
-    local cfg = vim.api.nvim_win_get_config(cur_win)
-    if cfg.relative == "" then
-        last_editor_win = cur_win
-    else
-        for _, w in ipairs(vim.api.nvim_list_wins()) do
-            local c = vim.api.nvim_win_get_config(w)
-            if c.relative == "" then
-                last_editor_win = w
-                break
-            end
-        end
+    if not minimal_menu_active and not force_create then
+        return
     end
 
-    update_marks()
-    local total_buffers = #marks
-
-    if total_buffers == 0 then
+    if not create_current_tab_window() then
         vim.notify(
             "No buffers to display",
             vim.log.levels.INFO,
@@ -1649,17 +1820,8 @@ function M.toggle_menu(force_create)
         return
     end
 
-    if not minimal_menu_active and not force_create then
-        return
-    end
-
-    local padding = config.ui.floating.label_padding or 1
-    local initial_width = 2 + 2 * padding
-    local win_info = create_window(total_buffers, initial_width)
-    bento_win_id = win_info.win_id
-    bento_bufh = win_info.bufnr
-
     is_expanded = false
+    current_action = nil
     current_page = 1
     if minimal_menu_active then
         render_collapsed()
@@ -1680,7 +1842,7 @@ function M.expand_menu()
     end
 
     -- Floating UI
-    if not bento_win_id or not vim.api.nvim_win_is_valid(bento_win_id) then
+    if not ensure_current_tab_window({ force_create = true }) then
         return
     end
 
@@ -1706,7 +1868,7 @@ function M.collapse_menu()
     end
 
     -- Floating UI
-    if not bento_win_id or not vim.api.nvim_win_is_valid(bento_win_id) then
+    if not ensure_current_tab_window({ render_collapsed = true }) then
         return
     end
 
@@ -1823,6 +1985,7 @@ function M.handle_main_keymap()
     end
 
     -- Floating UI
+    sync_current_tab_state()
     if bento_win_id and vim.api.nvim_win_is_valid(bento_win_id) then
         if is_expanded then
             local last_buf = get_last_accessed_buffer()
@@ -1869,7 +2032,7 @@ function M.refresh_menu()
     end
 
     -- Floating UI
-    if not bento_win_id or not vim.api.nvim_win_is_valid(bento_win_id) then
+    if not ensure_current_tab_window({ render_collapsed = true }) then
         return
     end
 
@@ -1925,6 +2088,13 @@ function M.cycle_minimal_menu()
     )
 
     if minimal_menu_active then
+        local tabpage, state = sync_current_tab_state()
+        if state and state.hidden then
+            set_tab_state(tabpage, nil)
+            bento_win_id = nil
+            bento_bufh = nil
+        end
+
         if not bento_win_id or not vim.api.nvim_win_is_valid(bento_win_id) then
             M.toggle_menu()
         else
@@ -1933,6 +2103,7 @@ function M.cycle_minimal_menu()
             end
         end
     else
+        sync_current_tab_state()
         if
             bento_win_id
             and vim.api.nvim_win_is_valid(bento_win_id)
@@ -1940,6 +2111,47 @@ function M.cycle_minimal_menu()
         then
             M.close_menu()
         end
+    end
+end
+
+--- Remove floating state for tabs that no longer exist
+--- @return nil
+function M.cleanup_tab_state()
+    local valid_tabs = {}
+    for _, tabpage in ipairs(vim.api.nvim_list_tabpages()) do
+        valid_tabs[tabpage] = true
+    end
+
+    for tabpage, _ in pairs(floating_tab_state) do
+        if valid_tabs[tabpage] then
+            get_tab_state(tabpage)
+        else
+            floating_tab_state[tabpage] = nil
+        end
+    end
+
+    sync_current_tab_state()
+end
+
+--- Ensure the floating UI is synced when entering a tab
+--- @return nil
+function M.handle_tab_enter()
+    M.setup_state()
+
+    if is_tabline_ui() then
+        if tabline_active then
+            M.refresh_menu()
+        end
+        return
+    end
+
+    M.cleanup_tab_state()
+    sync_current_tab_state()
+
+    if bento_win_id and vim.api.nvim_win_is_valid(bento_win_id) then
+        M.refresh_menu()
+    elseif minimal_menu_active then
+        ensure_current_tab_window({ render_collapsed = true })
     end
 end
 

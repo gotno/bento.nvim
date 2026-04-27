@@ -389,6 +389,30 @@ local function setup_autocmds()
         desc = "Update current window in bento menu",
     })
 
+    vim.api.nvim_create_autocmd("TabEnter", {
+        group = augroup,
+        callback = function()
+            require("bento.ui").handle_tab_enter()
+        end,
+        desc = "Sync bento menu for the active tab",
+    })
+
+    vim.api.nvim_create_autocmd("VimEnter", {
+        group = augroup,
+        callback = function()
+            require("bento.ui").handle_tab_enter()
+        end,
+        desc = "Create bento menu for the initial tab when buffers exist",
+    })
+
+    vim.api.nvim_create_autocmd("TabClosed", {
+        group = augroup,
+        callback = function()
+            require("bento.ui").cleanup_tab_state()
+        end,
+        desc = "Clean up bento state for closed tabs",
+    })
+
     vim.api.nvim_create_autocmd("CursorMoved", {
         group = augroup,
         callback = function(args)
@@ -511,6 +535,7 @@ local function setup_autocmds()
         callback = function()
             restore_locked_buffers()
             restore_buffer_metrics()
+            require("bento.ui").handle_tab_enter()
         end,
         desc = "Restore locked buffers and buffer metrics after session load",
     })
@@ -946,7 +971,7 @@ function M.setup(config)
         if BentoConfig.ui.mode == "tabline" then
             require("bento.ui").toggle_menu()
         elseif BentoConfig.ui.floating.minimal_menu then
-            require("bento.ui").toggle_menu()
+            require("bento.ui").handle_tab_enter()
         end
     end, 100)
 
